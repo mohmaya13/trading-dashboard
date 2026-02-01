@@ -1,15 +1,3 @@
-"""
-Refactored Trading Dashboard (app.py)
-- Replaces hardcoded password with Streamlit secrets / environment variable
-- Consolidates imports
-- Caches heavy data and backtests using @st.cache_data
-- Vectorizes backtest logic for listed strategies where possible
-- Ensures each tab computes results independently (no cross-tab dependency)
-- Fixes plotly width usage (use_container_width=True)
-- Adds spinners / seed for Monte Carlo sims
-- Lazy-imports seaborn/matplotlib only where needed
-"""
-
 import os
 from datetime import datetime, timedelta
 import streamlit as st
@@ -24,23 +12,21 @@ import plotly.graph_objects as go
 # -----------------------
 def check_password():
     """
-    Use Streamlit secrets (set in .streamlit/secrets.toml or Streamlit Cloud secrets)
+    Use Streamlit secrets (set in Streamlit Cloud secrets)
     key: dashboard_password
     Fallback: environment variable DASHBOARD_PASSWORD
     """
     secret_pwd = None
     try:
-        # st.secrets works on Streamlit sharing / cloud; local dev can use .streamlit/secrets.toml
         secret_pwd = st.secrets.get("dashboard_password")
     except Exception:
-        # ignore if secrets not set / not available
         secret_pwd = None
 
     if not secret_pwd:
         secret_pwd = os.environ.get("DASHBOARD_PASSWORD")
 
     if not secret_pwd:
-        st.error("Dashboard password not configured. Set `dashboard_password` in Streamlit secrets or set env var DASHBOARD_PASSWORD.")
+        st.error("Dashboard password not configured. Set `dashboard_password` in Streamlit secrets.")
         st.stop()
 
     if "authenticated" not in st.session_state:
@@ -51,12 +37,20 @@ def check_password():
         if pwd:
             if pwd == secret_pwd:
                 st.session_state.authenticated = True
-                st.experimental_rerun()
+                # use experimental_rerun to refresh app after auth
+                try:
+                    st.experimental_rerun()
+                except Exception:
+                    # fallback to rerun if API differs
+                    try:
+                        st.rerun()
+                    except Exception:
+                        pass
             else:
                 st.warning("Incorrect password.")
                 st.stop()
 
-# Call auth (after imports)
+# Call auth
 check_password()
 
 # -----------------------
@@ -74,11 +68,10 @@ STRATEGY_GROUPS = {
 # -----------------------
 # DATA ENGINE
 # -----------------------
-@st.cache_data(ttl=60*60*24)  # refresh daily
+@st.cache_data(ttl=86400)  # refresh daily
 def get_nifty_data() -> pd.DataFrame:
-    df = yf.download("^NSEI", period="10y", interval="1d", progress=False, threads=True)
+    df = yf.download("^NSEI", period="10y", interval="1d", progress=False)
     df.reset_index(inplace=True)
-    # Ensure Date is datetime
     df['Date'] = pd.to_datetime(df['Date'])
     df['Year'] = df['Date'].dt.year
     df['Month'] = df['Date'].dt.month
@@ -97,15 +90,10 @@ def get_nifty_data() -> pd.DataFrame:
 data = get_nifty_data()
 
 # -----------------------
-# BACKTEST ENGINE (CACHED + VECTORIZED)
+# BACKTEST ENGINE (FIXED FOR PANDAS DIMENSIONS)
 # -----------------------
 @st.cache_data
 def run_backtest_cached(df: pd.DataFrame, strat_name: str) -> pd.DataFrame:
-    """
-    Vectorized backtest on weekly expiries (Tuesday -> next Tuesday)
-    Falls back to a simple loop for strategies that may be complex.
-    Returns DataFrame with Date, Year, Week, PnL, Exit_Price, Cumulative
-    """
     expiries = df[df['Day'] == 'Tuesday'].reset_index(drop=True)
     n = len(expiries)
     if n < 2:
@@ -121,7 +109,6 @@ def run_backtest_cached(df: pd.DataFrame, strat_name: str) -> pd.DataFrame:
 
     pnl = np.zeros_like(move, dtype=float)
 
-    # Vectorized strategy implementations
     if strat_name == "Buy Call":
         pnl = np.maximum(0, move) - atm_prem
     elif strat_name == "Sell Put":
@@ -160,26 +147,14 @@ def run_backtest_cached(df: pd.DataFrame, strat_name: str) -> pd.DataFrame:
         pnl = np.abs(move) - (atm_prem * 1.5)
     elif strat_name == "Call Ratio Back Spread":
         pnl = np.where(move > 0, np.maximum(0, move*2) - atm_prem, -atm_prem*0.5)
-    else:
-        # fallback: mimic the original loop for unknown/complex strategies
-        logs = []
-        for i in range(len(entry)):
-            e, x, v, m = entry[i], exitp[i], vol[i], move[i]
-            ap = atm_prem[i]
-            p = 0.0
-            # Keep a best-effort fallback for unknown strategy names
-            p = (ap - abs(m) * 0.5) if abs(m) < e*0.02 else -e*0.01
-            logs.append({"Date": expiries.loc[i+1, "Date"], "Year": int(years[i]), "Week": int(weeks[i]), "PnL": p, "Exit_Price": x})
-        res = pd.DataFrame(logs)
-        res['Cumulative'] = res['PnL'].cumsum()
-        return res
 
+    # Use np.ravel() to ensure 1D arrays to prevent ValueError
     res = pd.DataFrame({
-        "Date": expiries.loc[1:, "Date"].values,
-        "Year": years,
-        "Week": weeks,
-        "PnL": pnl,
-        "Exit_Price": exitp
+        "Date": expiries['Date'].iloc[1:].values,
+        "Year": np.ravel(years),
+        "Week": np.ravel(weeks),
+        "PnL": np.ravel(pnl),
+        "Exit_Price": np.ravel(exitp)
     })
     res['Cumulative'] = res['PnL'].cumsum()
     return res
@@ -193,220 +168,82 @@ def compute_all_summaries(df: pd.DataFrame, strategy_groups: dict) -> pd.DataFra
             summaries.append({"Strategy": s, "View": view, "Total Pts": float(r['PnL'].sum())})
     return pd.DataFrame(summaries)
 
-# -----------------------
-# HELPER for tabs: get trade results safely
-# -----------------------
 def get_trade_results_for_choice(choice: str) -> pd.DataFrame:
-    with st.spinner(f"Running backtest for {choice}..."):
+    with st.spinner(f"Running backtest for {choice}..."): 
         return run_backtest_cached(data, choice)
 
 # -----------------------
-# UI / TABS
+# UI TABS
 # -----------------------
 st.title("🏛️ Nifty 50: Ultimate Strategy & Predictive Lab")
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "🎯 Strategy Lab", "🏆 Leaderboard", "📅 Seasonality",
-    "🔬 Micro-Insights", "🔮 Forecast", "⚡ Tactical Simulator","📅 Deep-Dive Calendar Backtester",
-    "📊 Dividend Impact & Ex-Date Analyzer"
-])
+tabs = st.tabs(["🎯 Strategy Lab", "🏆 Leaderboard", "📅 Seasonality", "🔬 Micro-Insights", "🔮 Forecast", "⚡ Tactical Simulator","📅 Deep-Dive", "📊 Dividends"])
 
-# ---------- TAB 1: Strategy Lab ----------
-with tab1:
+# TAB 1: Strategy Lab
+with tabs[0]:
     group = st.selectbox("Market View", list(STRATEGY_GROUPS.keys()), index=0)
     choice = st.selectbox("Select Strategy", STRATEGY_GROUPS[group])
     trade_results = get_trade_results_for_choice(choice)
-
-    c1, c2, c3 = st.columns(3)
-    total_pnl_pts = trade_results['PnL'].sum() if not trade_results.empty else 0.0
-    win_rate = (trade_results['PnL'] > 0).mean()*100 if not trade_results.empty else 0.0
-    c1.metric("Total PnL (Pts)", f"{total_pnl_pts:,.0f}")
-    c2.metric("Win Rate", f"{win_rate:.1f}%")
+    c1, c2 = st.columns(2)
+    c1.metric("Total PnL (Pts)", f"{trade_results['PnL'].sum():,.0f}" if not trade_results.empty else "0")
+    c2.metric("Win Rate", f"{(trade_results['PnL'] > 0).mean()*100:.1f}%" if not trade_results.empty else "0.0%")
     st.plotly_chart(px.line(trade_results, x="Date", y="Cumulative", title=f"Equity Curve: {choice}"), use_container_width=True)
 
-# ---------- TAB 2: Leaderboard ----------
-with tab2:
+# TAB 2: Leaderboard
+with tabs[1]:
     st.header("🏆 Multi-Strategy Leaderboard")
-    with st.spinner("Computing leaderboard..."):
-        all_summary_df = compute_all_summaries(data, STRATEGY_GROUPS)
-    # style on the UI side; keep the dataframe available
+    all_summary_df = compute_all_summaries(data, STRATEGY_GROUPS)
     if not all_summary_df.empty:
         st.dataframe(all_summary_df.sort_values("Total Pts", ascending=False), use_container_width=True)
     else:
         st.info("No strategy summaries available.")
 
-# ---------- TAB 3: Seasonality ----------
-with tab3:
-    st.header("📅 Seasonality Intelligence")
-    min_year, max_year = int(data['Year'].min()), int(data['Year'].max())
-    col_f1, col_f2 = st.columns([2, 1])
-    with col_f1:
-        selected_years = st.slider("Select Analysis Period", min_year, max_year, (2018, max_year))
-    with col_f2:
-        view_type = st.radio("Select Detail Level", ["Month over Month", "Week over Week", "Day over Day", "Week over Day"], horizontal=True)
-
-    f_data = data[(data['Year'] >= selected_years[0]) & (data['Year'] <= selected_years[1])]
-    day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-    month_order = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
-
-    # Lazy import seaborn/matplotlib only when needed
-    if view_type == "Month over Month":
-        import seaborn as sns
-        import matplotlib.pyplot as plt
-        mom_pivot = f_data.pivot_table(index='Year', columns='Month', values='Daily_Return', aggfunc='sum') * 100
-        mom_pivot.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+# TAB 3: Seasonality
+with tabs[2]:
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    view_type = st.radio("Level", ["Month", "Day"], horizontal=True)
+    if view_type == "Month":
+        pivot = data.pivot_table(index='Year', columns='MonthName', values='Daily_Return', aggfunc='sum') * 100
         fig, ax = plt.subplots(figsize=(12, 6))
-        sns.heatmap(mom_pivot, annot=True, cmap="RdYlGn", center=0, fmt=".1f", ax=ax)
+        sns.heatmap(pivot, annot=True, cmap="RdYlGn", fmt=".1f", ax=ax)
         st.pyplot(fig)
-    elif view_type == "Week over Week":
-        import seaborn as sns
-        import matplotlib.pyplot as plt
-        wow_pivot = f_data.pivot_table(index='Year', columns='Week', values='Daily_Return', aggfunc='sum') * 100
-        fig, ax = plt.subplots(figsize=(16, 8))
-        sns.heatmap(wow_pivot, annot=False, cmap="RdYlGn", center=0, ax=ax)
-        st.pyplot(fig)
-    elif view_type == "Day over Day":
-        import seaborn as sns
-        import matplotlib.pyplot as plt
-        dod_pivot = f_data.pivot_table(index='MonthName', columns='Day', values='Daily_Return', aggfunc='mean') * 100
-        dod_pivot = dod_pivot.reindex(index=month_order, columns=day_order).fillna(0)
+    else:
+        pivot = data.pivot_table(index='MonthName', columns='Day', values='Daily_Return', aggfunc='mean') * 100
+        # ensure consistent month ordering
+        month_order = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        pivot = pivot.reindex(index=month_order)
         fig, ax = plt.subplots(figsize=(10, 6))
-        sns.heatmap(dod_pivot, annot=True, cmap="RdYlGn", center=0, fmt=".2f", ax=ax)
+        sns.heatmap(pivot, annot=True, cmap="RdYlGn", ax=ax)
         st.pyplot(fig)
-    elif view_type == "Week over Day":
-        import seaborn as sns
-        import matplotlib.pyplot as plt
-        wod_pivot = f_data.pivot_table(index='Week', columns='Day', values='Daily_Return', aggfunc='mean') * 100
-        wod_pivot = wod_pivot.reindex(columns=day_order).fillna(0)
-        fig_wod, ax_wod = plt.subplots(figsize=(12, 14))
-        sns.heatmap(wod_pivot, annot=True, cmap="RdYlGn", center=0, fmt=".2f", ax=ax_wod, linewidths=0.5)
-        st.pyplot(fig_wod)
-        best_week = wod_pivot.mean(axis=1).idxmax() if not wod_pivot.empty else None
-        if best_week is not None:
-            st.info(f"💡 Historically, **Week {best_week}** has been the most bullish.")
-    st.divider()
 
-    # MCP AI Seasonality Insights (same logic but robust to empty data)
-    st.subheader("🔮 MCP AI: Seasonality Strategy Recommendations")
-    if f_data.empty:
-        st.info("No data for the selected years.")
+# TAB 4: Micro-Insights
+with tabs[3]:
+    v_choice = st.selectbox("Select Strategy for Insights", sum(list(STRATEGY_GROUPS.values()), []), index=0)
+    tr = get_trade_results_for_choice(v_choice)
+    if not tr.empty:
+        st.plotly_chart(px.bar(tr.tail(20), x="Date", y="PnL", color="PnL"), use_container_width=True)
     else:
-        day_stats = f_data.groupby('Day')['Daily_Return'].agg(['mean', 'std', 'count'])
-        day_stats = day_stats.reindex(day_order).fillna(0)
-        day_stats['Win_Rate'] = f_data.groupby('Day').apply(lambda x: (x['Daily_Return'] > 0).mean() * 100).reindex(day_order).fillna(0)
+        st.info("No PnL data for selected strategy.")
 
-        best_bull = day_stats['mean'].idxmax()
-        best_bear = day_stats['mean'].idxmin()
-        best_vol = day_stats['std'].idxmax()
-
-        c_ai1, c_ai2, c_ai3 = st.columns(3)
-        with c_ai1:
-            st.success(f"📈 **Top Bullish Day: {best_bull}**")
-            st.write(f"Average Return: **{day_stats.loc[best_bull, 'mean']*100:.3f}%**")
-            st.markdown(f"""
-            **Recommended Strategies:**
-            1. **Bull Put Spread**: High {day_stats.loc[best_bull, 'Win_Rate']:.1f}% Win Prob.
-            2. **Buy Call**: Best for trend following on {best_bull}.
-            3. **Sell Put**: Capitalize on the positive drift.
-            """)
-        with c_ai2:
-            st.error(f"📉 **Top Bearish Day: {best_bear}**")
-            st.write(f"Average Return: **{day_stats.loc[best_bear, 'mean']*100:.3f}%**")
-            st.markdown(f"""
-            **Recommended Strategies:**
-            1. **Bear Call Spread**
-            2. **Buy Put**
-            3. **Sell Call**
-            """)
-        with c_ai3:
-            st.warning(f"⚡ **Top Volatility Day: {best_vol}**")
-            st.write(f"Std Dev (Risk): **{day_stats.loc[best_vol, 'std']*100:.3f}%**")
-            st.markdown(f"""
-            **Recommended Strategies:**
-            1. **Long Straddle**
-            2. **Iron Condor** (if premiums support it)
-            3. **Long Strangle**
-            """)
-
-# ---------- TAB 4: Micro-Insights ----------
-with tab4:
-    st.header(f"🔬 Micro-Insights: Last 8 Weeks")
-    # Let user pick which strategy to inspect to avoid cross-tab dependency
-    all_strats = sum(list(STRATEGY_GROUPS.values()), [])
-    v_choice = st.selectbox("Select Strategy for Micro-Insights", all_strats, index=0)
-    trade_results_m = get_trade_results_for_choice(v_choice)
-    recent_8_weeks = trade_results_m.tail(8).copy() if not trade_results_m.empty else pd.DataFrame()
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if not recent_8_weeks.empty:
-            st.plotly_chart(px.line(recent_8_weeks, x="Date", y="Exit_Price", title="Price Momentum", markers=True), use_container_width=True)
-        else:
-            st.info("No recent trades to show.")
-    with col_b:
-        if not recent_8_weeks.empty:
-            st.plotly_chart(px.bar(recent_8_weeks, x="Date", y="PnL", color="PnL", title=f"Strategy PnL: {v_choice}", color_continuous_scale='RdYlGn'), use_container_width=True)
-        else:
-            st.info("No PnL data for selected strategy.")
-
-    st.divider()
-    st.write("**Full Weekly PnL Matrix**")
-    if not trade_results_m.empty:
-        weekly_matrix = trade_results_m.pivot_table(index='Year', columns='Week', values='PnL', aggfunc='mean').fillna(0)
-        st.dataframe(weekly_matrix, use_container_width=True)
-    else:
-        st.info("No weekly PnL matrix available for selected strategy.")
-
-# ---------- TAB 5: Forecast (Monte-Carlo) ----------
-with tab5:
-    st.header("🔮 MCP Command Center")
+# TAB 5: Forecast
+with tabs[4]:
+    st.header("🔮 Monte Carlo Forecast")
     recent = data.tail(500)
     mu, sigma, last_p = recent['Daily_Return'].mean(), recent['Daily_Return'].std(), data['Close'].iloc[-1]
-    sims = st.number_input("Monte Carlo Simulations", min_value=100, max_value=20000, value=2000, step=100)
-    days = st.number_input("Days to Simulate (next trading days)", min_value=1, max_value=30, value=5)
-    seed = st.number_input("Random Seed (0 = random)", value=0, step=1)
-    rng = np.random.default_rng(seed if seed != 0 else None)
+    sims = np.zeros((5, 1000))
+    for i in range(1000):
+        p = last_p
+        for d in range(5):
+            p *= (1 + np.random.normal(mu, sigma))
+            sims[d, i] = p
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(y=np.percentile(sims, 95, axis=1), name="Upper 95%"))
+    fig.add_trace(go.Scatter(y=np.median(sims, axis=1), name="Median"))
+    fig.add_trace(go.Scatter(y=np.percentile(sims, 5, axis=1), name="Lower 5%"))
+    st.plotly_chart(fig, use_container_width=True)
 
-    with st.spinner("Running Monte Carlo..."):
-        results = np.zeros((days, sims))
-        for s in range(sims):
-            p = last_p
-            series = []
-            for d in range(days):
-                p = p * (1 + float(rng.normal(mu, sigma)))
-                series.append(p)
-            results[:, s] = series
-
-    upper_95 = np.percentile(results, 95, axis=1)
-    lower_5 = np.percentile(results, 5, axis=1)
-    prob_up = (results[-1, :] > last_p).mean() * 100
-
-    days_labels = [f"Day {i+1}" for i in range(days)]
-    fig_f = go.Figure()
-    fig_f.add_trace(go.Scatter(x=days_labels, y=upper_95, name="Ceiling", line=dict(dash='dash', color='green')))
-    fig_f.add_trace(go.Scatter(x=days_labels, y=lower_5, name="Floor", fill='tonexty', line=dict(dash='dash', color='red')))
-    fig_f.add_trace(go.Scatter(x=days_labels, y=np.median(results, axis=1), name="Expected", line=dict(width=4, color='white')))
-    st.plotly_chart(fig_f, use_container_width=True)
-
-    # Strategy Suggestions
-    atm_strike = int(round(last_p / 50) * 50)
-    bull_strike = int(round(upper_95[-1] / 50) * 50) if len(upper_95) > 0 else atm_strike
-    bear_strike = int(round(lower_5[-1] / 50) * 50) if len(lower_5) > 0 else atm_strike
-
-    st.subheader(f"🚀 Best Action (Prob Up: {prob_up:.1f}%)")
-    ac1, ac2 = st.columns(2)
-    with ac1:
-        if prob_up > 55:
-            st.success(f"**Bullish:** Buy {atm_strike} CE / Sell {bull_strike} CE")
-        elif prob_up < 45:
-            st.error(f"**Bearish:** Buy {atm_strike} PE / Sell {bear_strike} PE")
-        else:
-            st.warning(f"**Neutral:** Iron Condor (Sell {bear_strike} PE & {bull_strike} CE)")
-    with ac2:
-        st.metric("Support Floor", bear_strike)
-        st.metric("Resistance Ceiling", bull_strike)
-
-# ---------- TAB 6: Tactical Simulator ----------
-with tab6:
+# TAB 6: Tactical Simulator
+with tabs[5]:
     st.header("⚡ Tactical Strategy Lab: Performance & Win Rate")
     all_years = sorted(data['Year'].unique(), reverse=True)
     sel_years = st.multiselect("Select Backtest Years", options=all_years, default=all_years[:2])
@@ -470,7 +307,7 @@ with tab6:
         exec_df['Peak'] = exec_df['Running_Cap'].cummax()
         exec_df['Drawdown'] = (exec_df['Running_Cap'] - exec_df['Peak']) / exec_df['Peak'] * 100
 
-        st.divider()
+        st.divider() 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Initial Capital", f"₹{initial_capital:,.0f}")
         m2.metric("Total PnL", f"₹{total_pnl:,.0f}")
@@ -504,8 +341,8 @@ with tab6:
     else:
         st.warning("No trades match these filters. Adjust VIX or Day selection.")
 
-# ---------- TAB 7: Weekly Strategy Game Plan ----------
-with tab7:
+# TAB 7: Weekly Game Plan (Deep-Dive / Professional)
+with tabs[6]:
     st.header("📅 Weekly Strategy Game Plan")
     with st.expander("⚙️ Settings, Risk & Brokerage", expanded=True):
         c1, c2, c3 = st.columns(3)
@@ -548,9 +385,11 @@ with tab7:
             m_l = net_c - (max(0, -l_move) if h_pts_t7 == 0 else min(max(0, -l_move), h_pts_t7))
             m_h = net_c - (max(0, -h_move) if h_pts_t7 == 0 else min(max(0, -h_move), h_pts_t7))
         elif strat == "Buy Call":
-            pnl, m_h, m_l = max(0, move)-s_prem, max(0, h_move)-s_prem, max(0, l_move)-s_prem
+            pnl = net_c - s_prem
+            m_h, m_l = max(0, move)-s_prem, max(0, h_move)-s_prem, max(0, l_move)-s_prem
         elif strat == "Buy Put":
-            pnl, m_h, m_l = max(0, -move)-s_prem, max(0, -l_move)-s_prem, max(0, -h_move)-s_prem
+            pnl = max(0, -move)-s_prem
+            m_h, m_l = max(0, -l_move)-s_prem, max(0, -h_move)-s_prem
         else:
             pnl = 0; m_l = 0; m_h = 0
 
@@ -635,9 +474,6 @@ with tab7:
     else:
         st.info("💡 **MCP Note:** Complete your Strategy Playbook to see AI Performance Insights here.")
 
-# ---------- TAB 8: Dividend Impact (placeholder) ----------
-with tab8:
-    st.header("📊 Dividend Impact & Ex-Date Analyzer")
-    st.info("Feature placeholder. Add dividend/ex-date analysis here if required.")
-
-# End of file
+# TAB 8: Dividends / Placeholder
+with tabs[7]:
+    st.write("Dividend analysis placeholder.")
