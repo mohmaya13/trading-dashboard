@@ -1,3 +1,19 @@
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        password = st.text_input("Enter Dashboard Password", type="password")
+        if password == "password": # Change this!
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.stop()
+
+check_password()
+
+
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
