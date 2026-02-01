@@ -1,3 +1,4 @@
+import streamlit as st
 def check_password():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
